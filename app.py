@@ -964,36 +964,39 @@ def remover_duplicados(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def agrupar_quantidades(df: pd.DataFrame) -> pd.DataFrame:
-    """Soma as quantidades de itens repetidos (mesma NF + mesmo código)."""
+    """Consolida: une as linhas com o mesmo código dentro da mesma nota e soma as quantidades.
+
+    Chave = NF de Referência + NF de Emissão + Código do Material. A ordem segue a
+    primeira aparição de cada código na nota. Funciona com o DataFrame completo ou só
+    com as 4 colunas principais.
+    """
     if df.empty:
         return df
     chaves = ["Nota Fiscal de Referência", "Nota Fiscal de Emissão", "Código do Material"]
-    return (
-        df.groupby(chaves, as_index=False, sort=False, dropna=False)
-        .agg(
-            {
-                "Quantidade": "sum",
-                "Descrição": "first",
-                "Unidade": "first",
-                "Chave de Acesso": "first",
-                "Arquivo": lambda s: ", ".join(dict.fromkeys(s)),
-                "Origem": lambda s: ", ".join(dict.fromkeys(s)),
-            }
-        )[df.columns]
-    )
+    regras = {"Quantidade": "sum"}
+    for col in df.columns:
+        if col in chaves or col == "Quantidade":
+            continue
+        if col in ("Arquivo", "Origem"):
+            regras[col] = lambda s: ", ".join(dict.fromkeys(s))
+        else:
+            regras[col] = "first"
+    out = df.groupby(chaves, as_index=False, sort=False, dropna=False).agg(regras)[list(df.columns)]
+    out["Quantidade"] = out["Quantidade"].round(6)  # evita resíduos de ponto flutuante (0,1+0,2)
+    return out
 
 
 # ===========================================================================
 # exportacao
 # ===========================================================================
-def para_excel(df: pd.DataFrame, resumo: pd.DataFrame | None = None) -> bytes:
-    """Gera um .xlsx com a aba "Itens" (e "Arquivos", se o resumo for informado)."""
+def para_excel(df: pd.DataFrame, abas_extras: dict[str, pd.DataFrame] | None = None,
+               nome_aba: str = "Consolidado") -> bytes:
+    """Gera um .xlsx: a primeira aba recebe `df`; `abas_extras` vira abas adicionais."""
     buffer = io.BytesIO()
-    df = preparar_exportacao(df)
+    abas = {nome_aba: df, **(abas_extras or {})}
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Itens", index=False)
-        if resumo is not None and not resumo.empty:
-            resumo.to_excel(writer, sheet_name="Arquivos", index=False)
+        for nome, tabela in abas.items():
+            preparar_exportacao(tabela).to_excel(writer, sheet_name=nome[:31], index=False)
 
         for ws in writer.book.worksheets:
             for cel in ws[1]:
@@ -1121,8 +1124,10 @@ if not arquivos:
 resultados = processar_uploads(arquivos)
 situacao = tabela_situacao(resultados)
 # Se o PDF e o XML da mesma nota forem enviados juntos, os itens contam uma vez só (XML tem prioridade).
-df, _ = remover_duplicados(consolidar(resultados))
-df = df[COLUNAS_PRINCIPAIS]
+itens, _ = remover_duplicados(consolidar(resultados))
+itens = itens[COLUNAS_PRINCIPAIS]
+# Consolidação: mesmo código na mesma nota vira uma linha só, com as quantidades somadas
+df = agrupar_quantidades(itens)
 
 # ---- Alertas -----------------------------------------------------------------
 com_problema = [r for r in resultados if r.erro or r.avisos]
@@ -1133,7 +1138,7 @@ if com_problema:
         + ". Veja os detalhes em “Situação por arquivo”."
     )
 else:
-    st.success(f"✔ {len(resultados)} arquivo(s) lidos — {len(df)} itens.")
+    st.success(f"✔ {len(resultados)} arquivo(s) lidos — {len(itens)} linhas de itens, {len(df)} códigos consolidados.")
 
 with st.expander("Situação por arquivo", expanded=bool(com_problema)):
     st.dataframe(
@@ -1144,37 +1149,58 @@ with st.expander("Situação por arquivo", expanded=bool(com_problema)):
     )
 
 # ---- Tabela consolidada ----------------------------------------------------
-st.subheader("Itens")
+st.subheader("Consolidado por código")
 
 if df.empty:
     st.error("Nenhum item foi extraído dos arquivos enviados.")
     st.stop()
 
-busca = st.text_input("Filtrar", placeholder="Digite um número de NF ou código de material...")
-visao = df
-if busca:
-    termo = busca.strip().lower()
-    mascara = visao.astype(str).apply(lambda col: col.str.lower().str.contains(termo, regex=False)).any(axis=1)
-    visao = visao[mascara]
 
-# exibe 2340 em vez de 2340.0 (fracionários como 2,5 continuam com casas decimais)
-st.dataframe(preparar_exportacao(visao).astype(str), hide_index=True, width="stretch")
-st.caption(f"{len(visao)} de {len(df)} linha(s).")
+def filtrar(tabela: pd.DataFrame, termo: str) -> pd.DataFrame:
+    if not termo:
+        return tabela
+    termo = termo.strip().lower()
+    mascara = tabela.astype(str).apply(lambda col: col.str.lower().str.contains(termo, regex=False)).any(axis=1)
+    return tabela[mascara]
+
+
+busca = st.text_input("Filtrar", placeholder="Digite um número de NF ou código de material...")
+visao = filtrar(df, busca)
+visao_itens = filtrar(itens, busca)
+
+
+def mostrar(tabela: pd.DataFrame) -> None:
+    # exibe 2340 em vez de 2340.0 (fracionários como 2,5 continuam com casas decimais)
+    st.dataframe(preparar_exportacao(tabela).astype(str), hide_index=True, width="stretch")
+
+
+mostrar(visao)
+unificadas = len(itens) - len(df)
+st.caption(
+    f"{len(visao)} de {len(df)} linha(s). "
+    + (f"{unificadas} linha(s) com código repetido foram unificadas e somadas." if unificadas else
+       "Nenhum código repetido dentro das notas.")
+)
+
+with st.expander("Ver item a item (exatamente como está nas notas)"):
+    mostrar(visao_itens)
+    st.caption(f"{len(visao_itens)} de {len(itens)} linha(s).")
 
 # ---- Downloads -------------------------------------------------------------
 carimbo = datetime.now().strftime("%Y%m%d_%H%M")
 d1, d2, _ = st.columns([1, 1, 3])
 d1.download_button(
     "⬇️ Baixar Excel (.xlsx)",
-    data=para_excel(visao),
+    data=para_excel(visao, {"Item a item": visao_itens}),
     file_name=f"notas_consolidadas_{carimbo}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     type="primary",
     on_click="ignore",
     width="stretch",
+    help="Aba 'Consolidado' (códigos somados) + aba 'Item a item' (como na nota).",
 )
 d2.download_button(
-    "⬇️ Baixar CSV",
+    "⬇️ Baixar CSV (consolidado)",
     data=para_csv(visao),
     file_name=f"notas_consolidadas_{carimbo}.csv",
     mime="text/csv",
