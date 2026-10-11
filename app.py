@@ -114,6 +114,7 @@ class ResultadoArquivo:
     tipo: str
     itens: list[ItemNF] = field(default_factory=list)
     avisos: list[str] = field(default_factory=list)
+    conferencias: list[str] = field(default_factory=list)
     erro: str | None = None
 
     @property
@@ -306,6 +307,10 @@ def processar_xml(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
         )
 
         dets = [c for c in inf if _local(c.tag) == "det"]
+        if dets:
+            resultado.conferencias.append(
+                f"NF {nf_emissao or '?'}: {len(dets)} {'item' if len(dets) == 1 else 'itens'} (XML oficial ✔)"
+            )
         if not dets:
             resultado.avisos.append(f"NF {nf_emissao or '?'}: nenhum item <det> encontrado.")
         for det in dets:
@@ -345,15 +350,24 @@ _RE_NUMERO_DANFE = [
 
 # Linha de item no layout padrão:
 # CÓDIGO  DESCRIÇÃO  NCM/SH  O/CST  CFOP  UN  QUANT  V.UNIT  V.TOTAL ...
+# A descrição é opcional: quando ela é longa, o DANFE a quebra em várias linhas
+# e o código fica sozinho na linha dos números, com o texto acima/abaixo.
+_NUM_BR = r"\d{1,3}(?:\.\d{3})*,\d+|\d+,\d+"
 _RE_LINHA_ITEM = re.compile(
-    r"^(?P<cod>\S+)\s+(?P<desc>.+?)\s+"
+    r"^(?P<cod>\S+)(?:\s+(?P<desc>.+?))?\s+"
     r"(?P<ncm>\d{8}|\d{4}\.\d{2}\.\d{2})\s+"
     r"(?P<cst>\d{2,4})\s+"
     r"(?P<cfop>\d{4}|\d\.\d{3})\s+"
     r"(?P<un>[A-Za-z][\w/.-]{0,7})\s+"
-    r"(?P<qtd>\d{1,3}(?:\.\d{3})*,\d+|\d+(?:,\d+)?)\s+"
-    r"(?P<vunit>\d{1,3}(?:\.\d{3})*,\d+|\d+,\d+)"
+    r"(?P<qtd>\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:,\d+)?)\s+"
+    rf"(?P<vunit>{_NUM_BR})\s+"
+    rf"(?P<vtot>{_NUM_BR})"
 )
+# Linha que "parece" item (tem NCM de 8 dígitos e CFOP) mas não foi reconhecida
+_RE_LINHA_SUSPEITA = re.compile(r"\b\d{8}\b.*\b[1-7]\d{3}\b")
+_RE_TOTAL_PRODUTOS = re.compile(r"VALOR\s+TOTAL\s+DOS\s+PRODUTOS")
+_RE_VALOR = re.compile(rf"(?<![\d,.])(?:{_NUM_BR})(?![\d,])")
+_TOLERANCIA_TOTAL = 0.05  # R$
 
 _RE_INFO_COMPL = re.compile(r"INFORMA[ÇC][ÕO]ES\s+COMPLEMENTARES|DADOS\s+ADICIONAIS", re.I)
 _RE_RESERVADO = re.compile(r"RESERVADO\s+AO\s+FISCO", re.I)
@@ -366,6 +380,7 @@ class _Pagina:
     info_compl: str
     chave: str | None
     numero: str  # número da NF lido do campo "Nº" (usado se não houver chave)
+    itens_pos: list[dict] = field(default_factory=list)  # itens lidos pela posição das palavras
 
     @property
     def ident(self) -> str:
@@ -421,10 +436,189 @@ def _texto_info_complementar(page: pdfplumber.page.Page, texto_pagina: str) -> s
     return _RE_RESERVADO.sub(" ", trecho).strip()
 
 
+def _sem_marca_dagua(page: pdfplumber.page.Page) -> pdfplumber.page.Page:
+    """Remove caracteres de marca d'água: inclinados/rotacionados ou com fonte muito
+    maior que a do texto normal (ex.: "NF-E SEM VALOR FISCAL" atravessando a página)."""
+    tamanhos = sorted(c["size"] for c in page.chars)
+    if not tamanhos:
+        return page
+    mediana = tamanhos[len(tamanhos) // 2]
+
+    def manter(obj) -> bool:
+        if obj.get("object_type") != "char":
+            return True
+        a, b, c, d, *_ = obj.get("matrix") or (1, 0, 0, 1, 0, 0)
+        horizontal = abs(b) < 1e-3 and abs(c) < 1e-3 and a > 0 and d > 0
+        return horizontal and obj["size"] <= mediana * 1.8
+
+    return page.filter(manter)
+
+
+# Parte numérica de uma linha de item (do NCM em diante) — usada por busca, não do início
+_RE_CAUDA_ITEM = re.compile(
+    r"(?:^|\s)(?P<ncm>\d{8}|\d{4}\.\d{2}\.\d{2})\s+"
+    r"(?P<cst>\d{2,4})\s+"
+    r"(?P<cfop>\d{4}|\d\.\d{3})\s+"
+    r"(?P<un>[A-Za-z][\w/.-]{0,7})\s+"
+    r"(?P<qtd>\d{1,3}(?:\.\d{3})+(?:,\d+)?|\d+(?:,\d+)?)\s+"
+    rf"(?P<vunit>{_NUM_BR})\s+"
+    rf"(?P<vtot>{_NUM_BR})"
+)
+# Títulos de quadro (bastam sozinhos) e títulos de coluna (precisam aparecer 2+ juntos)
+_TITULOS_QUADRO = ("DADOS DO PRODUTO", "DADOS ADICIONAIS", "INFORMACOES COMPLEMENTARES",
+                   "CALCULO DO ISSQN", "RESERVADO AO FISCO")
+_TITULOS_COLUNA = ("CODIGO", "DESCRI", "NCM", "QUANT", "CFOP", "CST", "UNID", "VALOR UNIT", "V.UNIT")
+
+
+def _linhas_de_palavras(page: pdfplumber.page.Page) -> list[dict]:
+    """Agrupa as palavras em linhas pela posição vertical. Cada linha guarda as palavras
+    (com coordenadas), o texto e o deslocamento de cada palavra dentro do texto."""
+    palavras = page.extract_words(keep_blank_chars=False, use_text_flow=False, x_tolerance=1.5)
+    palavras.sort(key=lambda w: (round(w["top"], 1), w["x0"]))
+    linhas: list[dict] = []
+    for w in palavras:
+        if linhas and abs(w["top"] - linhas[-1]["top"]) <= 1.5:
+            linhas[-1]["palavras"].append(w)
+        else:
+            linhas.append({"top": w["top"], "palavras": [w]})
+    for l in linhas:
+        l["palavras"].sort(key=lambda w: w["x0"])
+        l["bottom"] = max(w["bottom"] for w in l["palavras"])
+        l["meio"] = (l["top"] + l["bottom"]) / 2
+        partes, offsets, pos = [], [], 0
+        for w in l["palavras"]:
+            offsets.append(pos)
+            partes.append(w["text"])
+            pos += len(w["text"]) + 1
+        l["texto"] = " ".join(partes)
+        l["offsets"] = offsets
+    return linhas
+
+
+def _eh_cabecalho(texto: str) -> bool:
+    t = normalizar(texto)
+    if any(k in t for k in _TITULOS_QUADRO):
+        return True
+    return sum(k in t for k in _TITULOS_COLUNA) >= 2
+
+
+def _itens_por_posicao(page: pdfplumber.page.Page) -> list[dict]:
+    """Lê os itens usando a posição das palavras (robusto a descrições/códigos que
+    quebram em várias linhas, com alinhamento no topo, no meio ou na base da célula)."""
+    linhas = _linhas_de_palavras(page)
+    if not linhas:
+        return []
+
+    # 1) Âncoras: linhas que contêm a parte numérica do item
+    ancoras = []
+    for i, l in enumerate(linhas):
+        m = _RE_CAUDA_ITEM.search(l["texto"])
+        if not m:
+            continue
+        inicio = m.start("ncm")
+        prefixo = [w for w, off in zip(l["palavras"], l["offsets"]) if off < inicio]
+        ancoras.append({"idx": i, "m": m, "prefixo": prefixo})
+    if not ancoras:
+        return []
+
+    # 2) Fronteira entre a coluna do código e a da descrição
+    x_codigo = min(a["prefixo"][0]["x0"] for a in ancoras if a["prefixo"]) if any(a["prefixo"] for a in ancoras) else 0
+    inicios_desc = sorted(a["prefixo"][1]["x0"] for a in ancoras if len(a["prefixo"]) >= 2)
+    if inicios_desc:
+        fronteira = inicios_desc[len(inicios_desc) // 2] - 1.0
+    else:
+        fronteira = max((a["prefixo"][0]["x1"] for a in ancoras if a["prefixo"]), default=x_codigo) + 1.0
+    # início da coluna NCM (onde começam os números): nada de continuação passa daqui
+    x_numeros = min(
+        w["x0"] for a in ancoras
+        for w, off in zip(linhas[a["idx"]]["palavras"], linhas[a["idx"]]["offsets"])
+        if off == a["m"].start("ncm")
+    )
+
+    def continuacao_valida(k: int) -> bool:
+        """Linha de continuação: tem texto na coluna da descrição e nada nas colunas numéricas."""
+        ws = linhas[k]["palavras"]
+        if any(w["x1"] > x_numeros + 1 for w in ws):
+            return False
+        return any(w["x0"] >= fronteira for w in ws)
+
+    # 3) Distribui as linhas "soltas" entre as âncoras pelo maior espaço vertical
+    altura = sorted(l["bottom"] - l["top"] for l in linhas)[len(linhas) // 2] or 6.0
+    dono: dict[int, list[int]] = {a["idx"]: [] for a in ancoras}
+    idx_ancoras = [a["idx"] for a in ancoras]
+
+    def soltas(de: int, ate: int) -> list[int]:
+        # entre dois itens da mesma página não existe cabeçalho: toda linha é conteúdo
+        return list(range(de, ate))
+
+    # antes da primeira âncora / depois da última: só linhas coladas (sem cabeçalhos)
+    primeira, ultima = idx_ancoras[0], idx_ancoras[-1]
+    k = primeira - 1
+    while k >= 0 and not _eh_cabecalho(linhas[k]["texto"]) and continuacao_valida(k) and \
+            linhas[k + 1]["top"] - linhas[k]["top"] <= altura * 1.8:
+        dono[primeira].insert(0, k)
+        k -= 1
+    k = ultima + 1
+    while k < len(linhas) and not _eh_cabecalho(linhas[k]["texto"]) and continuacao_valida(k) and \
+            linhas[k]["top"] - linhas[k - 1]["top"] <= altura * 1.8:
+        dono[ultima].append(k)
+        k += 1
+    # entre âncoras consecutivas: corta no maior intervalo vertical
+    for a, b in zip(idx_ancoras, idx_ancoras[1:]):
+        meio = [k for k in soltas(a + 1, b) if continuacao_valida(k) or
+                all(w["x0"] < fronteira for w in linhas[k]["palavras"])]
+        if not meio:
+            continue
+        seq = [a] + meio + [b]
+        gaps = [linhas[seq[j + 1]]["top"] - linhas[seq[j]]["top"] for j in range(len(seq) - 1)]
+        corte = max(range(len(gaps)), key=lambda j: gaps[j])  # depois de seq[corte]
+        for j, k in enumerate(meio, start=1):
+            (dono[a] if j <= corte else dono[b]).append(k)
+
+    # 4) Monta cada item: código = palavras na coluna do código (de cima para baixo)
+    itens = []
+    for a in ancoras:
+        m = a["m"]
+        pedacos_cod: list[tuple[float, float, str]] = []
+        pedacos_desc: list[tuple[float, float, str]] = []
+        for w in a["prefixo"]:
+            alvo = pedacos_cod if w["x0"] < fronteira else pedacos_desc
+            alvo.append((w["top"], w["x0"], w["text"]))
+        for k in dono[a["idx"]]:
+            for w in linhas[k]["palavras"]:
+                if w["x0"] < fronteira and w["x1"] >= x_codigo - 2:
+                    pedacos_cod.append((w["top"], w["x0"], w["text"]))
+                elif w["x0"] >= fronteira:
+                    pedacos_desc.append((w["top"], w["x0"], w["text"]))
+        # ordena por linha (top arredondado) e depois por x
+        def juntar(pedacos, sep):
+            pedacos.sort(key=lambda p: (round(p[0]), p[1]))
+            return sep.join(p[2] for p in pedacos)
+
+        codigo = juntar(pedacos_cod, "")
+        if not codigo:
+            continue
+        itens.append(
+            {
+                "codigo": codigo,
+                "descricao": juntar(pedacos_desc, " "),
+                "unidade": m["un"],
+                "quantidade": converter_decimal(m["qtd"]),
+                "valor_total": converter_decimal(m["vtot"]),
+            }
+        )
+    return itens
+
+
 def _ler_paginas(pdf: pdfplumber.PDF) -> list[_Pagina]:
     paginas = []
-    for page in pdf.pages:
+    for page_original in pdf.pages:
+        page = _sem_marca_dagua(page_original)
         texto = page.extract_text() or ""
+        try:
+            itens_pos = _itens_por_posicao(page)
+        except Exception:  # noqa: BLE001 - nunca derrubar a leitura por causa desta estratégia
+            itens_pos = []
         try:
             tabelas = page.extract_tables() or []
         except Exception:  # noqa: BLE001
@@ -436,6 +630,7 @@ def _ler_paginas(pdf: pdfplumber.PDF) -> list[_Pagina]:
                 info_compl=_texto_info_complementar(page, texto) if texto else "",
                 chave=_chave_da_pagina(texto),
                 numero=_numero_no_texto(texto),
+                itens_pos=itens_pos,
             )
         )
     return paginas
@@ -480,21 +675,94 @@ def _numero_nf(nota: _Nota) -> str:
     return next((p.numero for p in nota.paginas if p.numero), "")
 
 
-def _itens_por_texto(nota: _Nota) -> list[dict]:
-    itens = []
+def _linha_de_texto_livre(linha: str) -> bool:
+    """Linha que pode ser continuação de descrição (não é cabeçalho, marca d'água etc.)."""
+    t = normalizar(linha)
+    if len(t.replace(" ", "")) <= 2:  # letras soltas da marca d'água
+        return False
+    return not any(k in t for k in ("DESCRI", "DADOS ADICIONAIS", "DADOS DO PRODUTO", "INSCRI", "NATUREZA"))
+
+
+def _itens_por_texto(nota: _Nota) -> tuple[list[dict], list[str]]:
+    """Retorna (itens, linhas suspeitas que parecem item mas não foram lidas)."""
+    itens: list[dict] = []
+    suspeitas: list[str] = []
     for pag in nota.paginas:
-        for linha in pag.texto.splitlines():
-            m = _RE_LINHA_ITEM.match(linha.strip())
-            if m:
-                itens.append(
-                    {
-                        "codigo": m["cod"],
-                        "descricao": m["desc"].strip(),
-                        "unidade": m["un"],
-                        "quantidade": converter_decimal(m["qtd"]),
-                    }
-                )
-    return itens
+        linhas = [l.strip() for l in pag.texto.splitlines()]
+        casou = [_RE_LINHA_ITEM.match(l) for l in linhas]
+        for i, (linha, m) in enumerate(zip(linhas, casou)):
+            if not m:
+                if _RE_LINHA_SUSPEITA.search(linha) and not _RE_CHAVE.search(linha):
+                    suspeitas.append(linha)
+                continue
+            descricao = (m["desc"] or "").strip()
+            if not descricao:
+                # descrição quebrada: junta a linha anterior e a seguinte (se forem texto livre)
+                partes = []
+                if i > 0 and not casou[i - 1] and _linha_de_texto_livre(linhas[i - 1]):
+                    partes.append(linhas[i - 1])
+                if i + 1 < len(linhas) and not casou[i + 1] and _linha_de_texto_livre(linhas[i + 1]) \
+                        and not _RE_LINHA_SUSPEITA.search(linhas[i + 1]):
+                    partes.append(linhas[i + 1])
+                descricao = " ".join(partes)
+            itens.append(
+                {
+                    "codigo": m["cod"],
+                    "descricao": descricao,
+                    "unidade": m["un"],
+                    "quantidade": converter_decimal(m["qtd"]),
+                    "valor_total": converter_decimal(m["vtot"]),
+                }
+            )
+    return itens, suspeitas
+
+
+def _total_produtos(nota: _Nota) -> float | None:
+    """Lê o campo "VALOR TOTAL DOS PRODUTOS" do quadro Cálculo do Imposto."""
+    for pag in nota.paginas:
+        linhas = pag.texto.splitlines()
+        for i, linha in enumerate(linhas):
+            if _RE_TOTAL_PRODUTOS.search(normalizar(linha)):
+                # o título da coluna é o último da linha; o valor é o último número da linha seguinte
+                for prox in linhas[i + 1 : i + 3]:
+                    valores = _RE_VALOR.findall(prox)
+                    if valores:
+                        return converter_decimal(valores[-1])
+    return None
+
+
+def _soma(itens: list[dict]) -> float | None:
+    if not itens or any(i.get("valor_total") is None for i in itens):
+        return None
+    return sum(i["valor_total"] for i in itens)
+
+
+def _escolher_estrategia(candidatos: list[list[dict]], total: float | None) -> list[dict]:
+    """Escolhe o resultado mais confiável entre as estratégias (em ordem de preferência):
+    1º) a que "fecha" com o total impresso da nota; 2º) a que leu mais itens."""
+    if total is not None:
+        for c in candidatos:
+            s = _soma(c)
+            if s is not None and abs(s - total) <= _TOLERANCIA_TOTAL:
+                return c
+    return max(candidatos, key=len)  # max() mantém o primeiro em caso de empate
+
+
+def _codigos_fora_do_padrao(codigos: list[str]) -> list[str]:
+    """Códigos muito mais longos que o normal da nota (sinal de texto "grudado" no código)."""
+    if len(codigos) < 3:
+        return [c for c in codigos if len(c) > 30]
+    tamanhos = sorted(len(c) for c in codigos)
+    mediana = tamanhos[len(tamanhos) // 2]
+    return list(dict.fromkeys(c for c in codigos if len(c) > max(mediana * 1.8, mediana + 6)))
+
+
+def _qtd_itens(n: int) -> str:
+    return f"{n} item" if n == 1 else f"{n} itens"
+
+
+def _brl(valor: float) -> str:
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def _indice_coluna(cabecalho: list[str], *termos: str, excluir: tuple[str, ...] = ()) -> int | None:
@@ -573,9 +841,34 @@ def processar_pdf(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
         info_compl = "\n".join(p.info_compl for p in nota.paginas if p.info_compl)
         referencia = extrair_referencia(info_compl, nf_emissao=nf_emissao)
 
-        por_texto = _itens_por_texto(nota)
+        por_posicao = [it for p in nota.paginas for it in p.itens_pos]
+        por_texto, suspeitas = _itens_por_texto(nota)
         por_tabela = _itens_por_tabela(nota)
-        itens = por_texto if len(por_texto) >= len(por_tabela) else por_tabela
+        total = _total_produtos(nota)
+        itens = _escolher_estrategia([por_posicao, por_texto, por_tabela], total)
+
+        # ---- Conferência interna de completude ---------------------------------
+        # O valor em R$ NÃO vai para o relatório: é usado só como "prova real" de que
+        # nenhuma linha de item foi pulada (soma das linhas lidas = total impresso).
+        rotulo = f"NF {nf_emissao or '?'}"
+        soma = _soma(itens)
+        if total is not None and soma is not None and itens:
+            if abs(soma - total) <= _TOLERANCIA_TOTAL:
+                resultado.conferencias.append(
+                    f"{rotulo}: {_qtd_itens(len(itens))} — todos os itens lidos ✔"
+                )
+            else:
+                resultado.avisos.append(
+                    f"{rotulo}: ATENÇÃO — pode haver item faltando nesta nota "
+                    f"({_qtd_itens(len(itens))} lidos). Confira com o PDF ou use o XML."
+                )
+        elif itens:
+            resultado.conferencias.append(f"{rotulo}: {_qtd_itens(len(itens))} lidos (conferência automática indisponível neste layout)")
+        lidos_ok = total is not None and soma is not None and abs(soma - total) <= _TOLERANCIA_TOTAL
+        for cod in _codigos_fora_do_padrao([i["codigo"] for i in itens]):
+            resultado.avisos.append(f"{rotulo}: código com formato incomum, confira: {cod!r}")
+        for linha in ([] if lidos_ok else suspeitas[:5]):
+            resultado.avisos.append(f"{rotulo}: linha não reconhecida como item: {linha[:90]!r}")
 
         if not itens:
             resultado.avisos.append(
@@ -696,6 +989,7 @@ def agrupar_quantidades(df: pd.DataFrame) -> pd.DataFrame:
 def para_excel(df: pd.DataFrame, resumo: pd.DataFrame | None = None) -> bytes:
     """Gera um .xlsx com a aba "Itens" (e "Arquivos", se o resumo for informado)."""
     buffer = io.BytesIO()
+    df = preparar_exportacao(df)
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="Itens", index=False)
         if resumo is not None and not resumo.empty:
@@ -712,17 +1006,56 @@ def para_excel(df: pd.DataFrame, resumo: pd.DataFrame | None = None) -> bytes:
                 largura = max(len(str(v)) if v is not None else 0 for v in coluna)
                 ws.column_dimensions[get_column_letter(i)].width = min(max(largura + 2, 10), 60)
 
-        ws_itens = writer.book["Itens"]
-        if "Quantidade" in df.columns:
-            col = df.columns.get_loc("Quantidade") + 1
-            for (cel,) in ws_itens.iter_rows(min_row=2, min_col=col, max_col=col):
-                cel.number_format = "#,##0.####"
+        # Todas as células no formato "Geral" do Excel (nada de formato Texto)
+        for ws in writer.book.worksheets:
+            for linha in ws.iter_rows():
+                for cel in linha:
+                    cel.number_format = "General"
     return buffer.getvalue()
+
+
+def _nf_como_numero(valor):
+    """'6265' -> 6265 (evita o triângulo verde de "número armazenado como texto")."""
+    return int(valor) if isinstance(valor, str) and valor.isdigit() else valor
+
+
+def _codigo_como_numero(valor):
+    """Código só com dígitos vira número ('12345' -> 12345).
+
+    Códigos com zero à esquerda ('000123') continuam como texto, senão o Excel
+    apagaria os zeros e o código ficaria errado. Códigos com letras/traço ('0402-81')
+    são texto por natureza e já ficam corretos no formato Geral.
+    """
+    if isinstance(valor, str) and valor.isdigit() and not (len(valor) > 1 and valor.startswith("0")):
+        return int(valor)
+    return valor
+
+
+def preparar_exportacao(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in ("Nota Fiscal de Referência", "Nota Fiscal de Emissão"):
+        if col in out.columns:
+            out[col] = out[col].map(_nf_como_numero).astype(object)
+    if "Código do Material" in out.columns:
+        out["Código do Material"] = out["Código do Material"].map(_codigo_como_numero).astype(object)
+    if "Quantidade" in out.columns:
+        # lista + dtype object: impede o pandas de converter tudo de volta para float
+        out["Quantidade"] = pd.Series(
+            [int(q) if isinstance(q, float) and q.is_integer() else q for q in out["Quantidade"]],
+            index=out.index,
+            dtype=object,
+        )
+    return out
 
 
 def para_csv(df: pd.DataFrame) -> bytes:
     """CSV no padrão do Excel em português: separador ';', decimal ',' e BOM UTF-8."""
-    return df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+    out = preparar_exportacao(df)
+    if "Quantidade" in out.columns:
+        out["Quantidade"] = out["Quantidade"].map(
+            lambda q: "" if q is None or q != q else str(q).replace(".", ",")
+        )
+    return out.to_csv(index=False, sep=";").encode("utf-8-sig")
 
 
 # ===========================================================================
@@ -736,7 +1069,7 @@ st.set_page_config(page_title="Consolidador de NF-e", page_icon="🧾", layout="
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False, max_entries=2000)
 def _processar_em_cache(nome: str, digest: str, _conteudo: bytes) -> ResultadoArquivo:
-    # O cache é indexado pelo nome + hash SHA-256; o conteúdo em si não é re-hasheado.
+    # O cache é indexado pelo nome + hash SHA-256 do arquivo.
     return processar_arquivo(nome, _conteudo)
 
 
@@ -752,20 +1085,17 @@ def processar_uploads(arquivos) -> list[ResultadoArquivo]:
     return resultados
 
 
-def tabela_resumo(resultados: list[ResultadoArquivo]) -> pd.DataFrame:
-    return pd.DataFrame(
-        [
-            {
-                "Arquivo": r.arquivo,
-                "Tipo": r.tipo,
-                "Status": r.status,
-                "Notas": ", ".join(sorted(r.notas, key=lambda n: n.zfill(9))),
-                "Itens": len(r.itens),
-                "Mensagens": r.erro or " | ".join(r.avisos),
-            }
-            for r in resultados
-        ]
-    )
+def tabela_situacao(resultados: list[ResultadoArquivo]) -> pd.DataFrame:
+    linhas = []
+    for r in resultados:
+        if r.erro:
+            situacao = f"❌ {r.erro}"
+        elif r.avisos:
+            situacao = "⚠️ " + " | ".join(r.avisos)
+        else:
+            situacao = " | ".join(r.conferencias) or "✔"
+        linhas.append({"Arquivo": r.arquivo, "Itens": len(r.itens), "Situação": situacao})
+    return pd.DataFrame(linhas)
 
 
 # --------------------------------------------------------------------------- #
@@ -773,33 +1103,9 @@ def tabela_resumo(resultados: list[ResultadoArquivo]) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 st.title("🧾 Consolidador de Notas Fiscais")
 st.caption(
-    "Envie DANFEs (PDF) e/ou XMLs de NF-e. Os itens de todas as notas são reunidos "
-    "em uma única tabela, pronta para download em Excel ou CSV."
+    "Envie DANFEs (PDF) e/ou XMLs de NF-e. O resultado traz, item a item: "
+    "NF de Referência, NF de Emissão, Código do Material e Quantidade."
 )
-
-with st.sidebar:
-    st.header("Opções")
-    mostrar_detalhes = st.toggle(
-        "Mostrar colunas extras",
-        value=False,
-        help="Descrição, unidade, chave de acesso, arquivo de origem e tipo (PDF/XML).",
-    )
-    deduplicar = st.toggle(
-        "Ignorar notas repetidas",
-        value=True,
-        help="Se a mesma nota for enviada mais de uma vez (ex.: PDF e XML), "
-        "considera apenas um arquivo — o XML tem prioridade.",
-    )
-    agrupar = st.toggle(
-        "Somar itens repetidos",
-        value=False,
-        help="Soma a quantidade de linhas com a mesma NF e o mesmo código de material.",
-    )
-    st.divider()
-    st.markdown(
-        "**Dica:** sempre que possível use o XML — ele é a fonte oficial da NF-e. "
-        "PDFs escaneados (imagem) não são lidos."
-    )
 
 arquivos = st.file_uploader(
     "Selecione ou arraste os arquivos",
@@ -813,67 +1119,54 @@ if not arquivos:
     st.stop()
 
 resultados = processar_uploads(arquivos)
-resumo = tabela_resumo(resultados)
-df = consolidar(resultados)
+situacao = tabela_situacao(resultados)
+# Se o PDF e o XML da mesma nota forem enviados juntos, os itens contam uma vez só (XML tem prioridade).
+df, _ = remover_duplicados(consolidar(resultados))
+df = df[COLUNAS_PRINCIPAIS]
 
-removidos = 0
-if deduplicar:
-    df, removidos = remover_duplicados(df)
-if agrupar:
-    df = agrupar_quantidades(df)
+# ---- Alertas -----------------------------------------------------------------
+com_problema = [r for r in resultados if r.erro or r.avisos]
+if com_problema:
+    st.warning(
+        f"⚠️ {len(com_problema)} arquivo(s) precisam de conferência: "
+        + ", ".join(r.arquivo for r in com_problema)
+        + ". Veja os detalhes em “Situação por arquivo”."
+    )
+else:
+    st.success(f"✔ {len(resultados)} arquivo(s) lidos — {len(df)} itens.")
 
-# ---- Indicadores -----------------------------------------------------------
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Arquivos", len(resultados))
-c2.metric("Notas fiscais", df["Nota Fiscal de Emissão"].nunique() if not df.empty else 0)
-c3.metric("Itens", len(df))
-c4.metric("Com erro/aviso", int((resumo["Status"] != "OK").sum()))
-
-problemas = resumo[resumo["Status"] != "OK"]
-if not problemas.empty:
-    st.warning(f"{len(problemas)} arquivo(s) com erro ou aviso — veja os detalhes abaixo.")
-if removidos:
-    st.info(f"{removidos} linha(s) ignorada(s) por pertencerem a notas enviadas em duplicidade.")
-
-with st.expander("Status por arquivo", expanded=not problemas.empty):
+with st.expander("Situação por arquivo", expanded=bool(com_problema)):
     st.dataframe(
-        resumo,
+        situacao,
         hide_index=True,
         width="stretch",
-        column_config={"Mensagens": st.column_config.TextColumn(width="large")},
+        column_config={"Situação": st.column_config.TextColumn(width="large")},
     )
 
 # ---- Tabela consolidada ----------------------------------------------------
-st.subheader("Itens consolidados")
+st.subheader("Itens")
 
 if df.empty:
     st.error("Nenhum item foi extraído dos arquivos enviados.")
     st.stop()
 
-busca = st.text_input("Filtrar", placeholder="Digite um número de NF, código de material...")
-visao = df if mostrar_detalhes else df[COLUNAS_PRINCIPAIS]
+busca = st.text_input("Filtrar", placeholder="Digite um número de NF ou código de material...")
+visao = df
 if busca:
     termo = busca.strip().lower()
     mascara = visao.astype(str).apply(lambda col: col.str.lower().str.contains(termo, regex=False)).any(axis=1)
     visao = visao[mascara]
 
-st.dataframe(
-    visao,
-    hide_index=True,
-    width="stretch",
-    column_config={
-        "Quantidade": st.column_config.NumberColumn(format="%.4f"),
-        "Chave de Acesso": st.column_config.TextColumn(width="medium"),
-    },
-)
-st.caption(f"{len(visao)} de {len(df)} linha(s) exibida(s).")
+# exibe 2340 em vez de 2340.0 (fracionários como 2,5 continuam com casas decimais)
+st.dataframe(preparar_exportacao(visao).astype(str), hide_index=True, width="stretch")
+st.caption(f"{len(visao)} de {len(df)} linha(s).")
 
 # ---- Downloads -------------------------------------------------------------
 carimbo = datetime.now().strftime("%Y%m%d_%H%M")
 d1, d2, _ = st.columns([1, 1, 3])
 d1.download_button(
     "⬇️ Baixar Excel (.xlsx)",
-    data=para_excel(visao, resumo),
+    data=para_excel(visao),
     file_name=f"notas_consolidadas_{carimbo}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     type="primary",
