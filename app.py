@@ -666,15 +666,24 @@ def _data_emissao_da_pagina(page: pdfplumber.page.Page, texto: str) -> str:
         d = _RE_DATA.search(depois[:40])
         if d and _data_iso(*d.groups()):
             return _data_iso(*d.groups())
-    # 3) fallback textual
+    # 3) fallback textual: rótulo "EMISSÃO" e a primeira data nas linhas seguintes
     linhas_txt = texto.splitlines()
     for i, linha in enumerate(linhas_txt):
-        if _RE_ROTULO_EMISSAO.search(normalizar(linha)):
+        if _RE_ROTULO_EMISSAO.search(normalizar(linha)) or re.search(r"\bEMISSAO\b", normalizar(linha)):
             for trecho in [linha] + linhas_txt[i + 1 : i + 3]:
                 d = _RE_DATA.search(trecho)
                 if d and _data_iso(*d.groups()):
                     return _data_iso(*d.groups())
     return ""
+
+
+def _data_do_protocolo(texto: str) -> str:
+    """Último recurso: data do protocolo de autorização (em geral, o mesmo dia da emissão)."""
+    t = normalizar(texto)
+    m = re.search(r"PROTOCOLO[^\n]*\n?[^\n]*?(\d{2})/(\d{2})/(\d{4})", t)
+    if not m:
+        m = re.search(r"\b\d{15}\s*-?\s*(\d{2})/(\d{2})/(\d{4})", t)  # "113260000012345 01/10/2026"
+    return _data_iso(*m.groups()) if m else ""
 
 
 def _ler_paginas(pdf: pdfplumber.PDF) -> list[_Pagina]:
@@ -910,7 +919,14 @@ def processar_pdf(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
         referencia = extrair_referencia(info_compl, nf_emissao=nf_emissao)
         data_emissao = next((p.data_emissao for p in nota.paginas if p.data_emissao), "")
         if not data_emissao:
-            resultado.avisos.append(f"NF {nf_emissao or '?'}: data de emissão não encontrada no PDF.")
+            data_emissao = next((d for p in nota.paginas if (d := _data_do_protocolo(p.texto))), "")
+            if data_emissao:
+                resultado.avisos.append(
+                    f"NF {nf_emissao or '?'}: campo 'Data de Emissão' não localizado; usada a data do "
+                    "protocolo de autorização — confira."
+                )
+            else:
+                resultado.avisos.append(f"NF {nf_emissao or '?'}: data de emissão não encontrada no PDF.")
 
         por_posicao = [it for p in nota.paginas for it in p.itens_pos]
         por_texto, suspeitas = _itens_por_texto(nota)
@@ -1186,9 +1202,14 @@ st.set_page_config(page_title="Consolidador de NF-e", page_icon="🧾", layout="
 # --------------------------------------------------------------------------- #
 # Processamento (com cache: reenviar o mesmo arquivo não reprocessa)
 # --------------------------------------------------------------------------- #
+# Mude este valor a cada nova versão do leitor: força o reprocessamento dos arquivos
+# (sem isso, um arquivo já enviado antes poderia mostrar o resultado da versão antiga).
+VERSAO_LEITOR = "2026-10-11.4"
+
+
 @st.cache_data(show_spinner=False, max_entries=2000)
-def _processar_em_cache(nome: str, digest: str, _conteudo: bytes) -> ResultadoArquivo:
-    # O cache é indexado pelo nome + hash SHA-256 do arquivo.
+def _processar_em_cache(nome: str, digest: str, versao: str, _conteudo: bytes) -> ResultadoArquivo:
+    # O cache é indexado pelo nome + hash SHA-256 do arquivo + versão do leitor.
     return processar_arquivo(nome, _conteudo)
 
 
@@ -1198,7 +1219,7 @@ def processar_uploads(arquivos) -> list[ResultadoArquivo]:
     for i, arq in enumerate(arquivos, start=1):
         conteudo = arq.getvalue()
         digest = hashlib.sha256(conteudo).hexdigest()
-        resultados.append(_processar_em_cache(arq.name, digest, conteudo))
+        resultados.append(_processar_em_cache(arq.name, digest, VERSAO_LEITOR, conteudo))
         barra.progress(i / len(arquivos), text=f"Processando {i}/{len(arquivos)}: {arq.name}")
     barra.empty()
     return resultados
@@ -1331,3 +1352,5 @@ d2.download_button(
     on_click="ignore",
     width="stretch",
 )
+
+st.caption(f"Versão do leitor: {VERSAO_LEITOR}")
