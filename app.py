@@ -101,6 +101,7 @@ class ItemNF:
     quantidade: float | None
     descricao: str = ""
     unidade: str = ""
+    data_emissao: str = ""  # ISO "AAAA-MM-DD" ("" se não encontrada)
     chave_acesso: str = ""
     arquivo: str = ""
     origem: str = ""  # "XML" ou "PDF"
@@ -298,6 +299,11 @@ def processar_xml(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
         if not nf_emissao:
             resultado.avisos.append("Número da NF (nNF) não encontrado.")
 
+        # Data de emissão: dhEmi (NF-e 3.10/4.00, "2026-10-01T09:30:00-04:00") ou dEmi (2.00)
+        data_emissao = (_texto(ide, "dhEmi") or _texto(ide, "dEmi"))[:10]
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", data_emissao):
+            data_emissao = ""
+            resultado.avisos.append(f"NF {nf_emissao or '?'}: data de emissão não encontrada no XML.")
         chave = re.sub(r"\D", "", inf.get("Id", ""))
         inf_cpl = _texto(inf, "infAdic", "infCpl")
         referencia = extrair_referencia(
@@ -329,6 +335,7 @@ def processar_xml(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
                     quantidade=quantidade,
                     descricao=_texto(prod, "xProd"),
                     unidade=_texto(prod, "uCom"),
+                    data_emissao=data_emissao,
                     chave_acesso=chave if len(chave) == 44 else "",
                     arquivo=nome_arquivo,
                     origem="XML",
@@ -381,6 +388,7 @@ class _Pagina:
     chave: str | None
     numero: str  # número da NF lido do campo "Nº" (usado se não houver chave)
     itens_pos: list[dict] = field(default_factory=list)  # itens lidos pela posição das palavras
+    data_emissao: str = ""  # ISO "AAAA-MM-DD"
 
     @property
     def ident(self) -> str:
@@ -610,6 +618,65 @@ def _itens_por_posicao(page: pdfplumber.page.Page) -> list[dict]:
     return itens
 
 
+_RE_DATA = re.compile(r"(?<!\d)(\d{2})/(\d{2})/(\d{4})(?!\d)")
+_RE_ROTULO_EMISSAO = re.compile(r"\b(?:DATA\s+D[AEO]\s+|DT\.?\s*(?:DE\s+)?)EMISSAO\b")
+
+
+def _data_iso(dia: str, mes: str, ano: str) -> str:
+    from datetime import date
+
+    try:
+        return date(int(ano), int(mes), int(dia)).isoformat()
+    except ValueError:
+        return ""
+
+
+def _data_emissao_da_pagina(page: pdfplumber.page.Page, texto: str) -> str:
+    """Data de emissão da NF no DANFE.
+
+    1) Pela posição: a data logo ABAIXO do rótulo "DATA DE EMISSÃO" (quadro do
+       destinatário), alinhada com ele — evita pegar a "DATA DE SAÍDA/ENTRADA".
+    2) Na mesma linha, logo após o rótulo (ex.: canhoto "data de emissão: 01/10/2026").
+    3) Pelo texto: primeira data nas 2 linhas seguintes ao rótulo.
+    """
+    linhas = _linhas_de_palavras(page)
+    for i, l in enumerate(linhas):
+        t = normalizar(l["texto"])
+        m = _RE_ROTULO_EMISSAO.search(t)
+        if not m:
+            continue
+        # palavras que formam o rótulo (pelo deslocamento no texto)
+        rotulo = [w for w, off in zip(l["palavras"], l["offsets"]) if m.start() <= off < m.end()]
+        if not rotulo:
+            continue
+        x0, x1 = rotulo[0]["x0"], rotulo[-1]["x1"]
+        # 1) abaixo e alinhada
+        for abaixo in linhas[i + 1 : i + 4]:
+            if abaixo["top"] - l["bottom"] > 25:
+                break
+            for w in abaixo["palavras"]:
+                d = _RE_DATA.search(w["text"])
+                centro = (w["x0"] + w["x1"]) / 2
+                if d and x0 - 20 <= centro <= x1 + 20:
+                    iso = _data_iso(*d.groups())
+                    if iso:
+                        return iso
+        # 2) na mesma linha, logo depois do rótulo
+        depois = l["texto"][l["offsets"][l["palavras"].index(rotulo[-1])] :]
+        d = _RE_DATA.search(depois[:40])
+        if d and _data_iso(*d.groups()):
+            return _data_iso(*d.groups())
+    # 3) fallback textual
+    linhas_txt = texto.splitlines()
+    for i, linha in enumerate(linhas_txt):
+        if _RE_ROTULO_EMISSAO.search(normalizar(linha)):
+            for trecho in [linha] + linhas_txt[i + 1 : i + 3]:
+                d = _RE_DATA.search(trecho)
+                if d and _data_iso(*d.groups()):
+                    return _data_iso(*d.groups())
+    return ""
+
+
 def _ler_paginas(pdf: pdfplumber.PDF) -> list[_Pagina]:
     paginas = []
     for page_original in pdf.pages:
@@ -631,6 +698,7 @@ def _ler_paginas(pdf: pdfplumber.PDF) -> list[_Pagina]:
                 chave=_chave_da_pagina(texto),
                 numero=_numero_no_texto(texto),
                 itens_pos=itens_pos,
+                data_emissao=_data_emissao_da_pagina(page, texto) if texto else "",
             )
         )
     return paginas
@@ -840,6 +908,9 @@ def processar_pdf(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
 
         info_compl = "\n".join(p.info_compl for p in nota.paginas if p.info_compl)
         referencia = extrair_referencia(info_compl, nf_emissao=nf_emissao)
+        data_emissao = next((p.data_emissao for p in nota.paginas if p.data_emissao), "")
+        if not data_emissao:
+            resultado.avisos.append(f"NF {nf_emissao or '?'}: data de emissão não encontrada no PDF.")
 
         por_posicao = [it for p in nota.paginas for it in p.itens_pos]
         por_texto, suspeitas = _itens_por_texto(nota)
@@ -886,6 +957,7 @@ def processar_pdf(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
                     quantidade=it["quantidade"],
                     descricao=it["descricao"],
                     unidade=it["unidade"],
+                    data_emissao=data_emissao,
                     chave_acesso=nota.chave or "",
                     arquivo=nome_arquivo,
                     origem="PDF",
@@ -898,9 +970,10 @@ def processar_pdf(conteudo: bytes, nome_arquivo: str) -> ResultadoArquivo:
 # processador
 # ===========================================================================
 COLUNAS = {
-    "nf_referencia": "Nota Fiscal de Referência",
-    "nf_emissao": "Nota Fiscal de Emissão",
-    "codigo_material": "Código do Material",
+    "data_emissao": "Data de Emissão da Nota",
+    "nf_referencia": "Nota de Referência",
+    "nf_emissao": "Nota Emitida",
+    "codigo_material": "Código do Produto",
     "quantidade": "Quantidade",
     "descricao": "Descrição",
     "unidade": "Unidade",
@@ -908,7 +981,14 @@ COLUNAS = {
     "arquivo": "Arquivo",
     "origem": "Origem",
 }
-COLUNAS_PRINCIPAIS = list(COLUNAS.values())[:4]
+# Colunas do relatório, na ordem pedida
+COLUNAS_PRINCIPAIS = [
+    "Data de Emissão da Nota",
+    "Código do Produto",
+    "Quantidade",
+    "Nota Emitida",
+    "Nota de Referência",
+]
 
 
 def detectar_tipo(nome: str, conteudo: bytes) -> str | None:
@@ -955,24 +1035,25 @@ def remover_duplicados(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     if df.empty:
         return df, 0
     # Identificador da nota: chave de acesso (única no país); sem chave, o número da NF
-    ident = df["Chave de Acesso"].where(df["Chave de Acesso"] != "", "NF:" + df["Nota Fiscal de Emissão"])
+    ident = df["Chave de Acesso"].where(df["Chave de Acesso"] != "", "NF:" + df["Nota Emitida"])
     ordenado = df.assign(_id=ident, _prio=(df["Origem"] != "XML").astype(int)).sort_values("_prio", kind="stable")
     arquivo_escolhido = ordenado.groupby("_id", sort=False)["Arquivo"].first()
     manter = df["Arquivo"] == ident.map(arquivo_escolhido)
-    manter |= df["Nota Fiscal de Emissão"].eq("") & df["Chave de Acesso"].eq("")
+    manter |= df["Nota Emitida"].eq("") & df["Chave de Acesso"].eq("")
     return df[manter].reset_index(drop=True), int((~manter).sum())
 
 
 def agrupar_quantidades(df: pd.DataFrame) -> pd.DataFrame:
     """Consolida: une as linhas com o mesmo código dentro da mesma nota e soma as quantidades.
 
-    Chave = NF de Referência + NF de Emissão + Código do Material. A ordem segue a
+    Chave = Data + Nota de Referência + Nota Emitida + Código do Produto. A ordem segue a
     primeira aparição de cada código na nota. Funciona com o DataFrame completo ou só
-    com as 4 colunas principais.
+    com as colunas principais.
     """
     if df.empty:
         return df
-    chaves = ["Nota Fiscal de Referência", "Nota Fiscal de Emissão", "Código do Material"]
+    chaves = [c for c in ("Data de Emissão da Nota", "Nota de Referência", "Nota Emitida", "Código do Produto")
+              if c in df.columns]
     regras = {"Quantidade": "sum"}
     for col in df.columns:
         if col in chaves or col == "Quantidade":
@@ -1009,12 +1090,43 @@ def para_excel(df: pd.DataFrame, abas_extras: dict[str, pd.DataFrame] | None = N
                 largura = max(len(str(v)) if v is not None else 0 for v in coluna)
                 ws.column_dimensions[get_column_letter(i)].width = min(max(largura + 2, 10), 60)
 
-        # Todas as células no formato "Geral" do Excel (nada de formato Texto)
+        # Todas as células no formato "Geral" do Excel (nada de formato Texto)...
         for ws in writer.book.worksheets:
             for linha in ws.iter_rows():
                 for cel in linha:
                     cel.number_format = "General"
+            # ...exceto a data: é gravada como DATA de verdade (filtra/ordena como data).
+            # No formato Geral o Excel mostraria o número serial (ex.: 46296).
+            cabecalho = [c.value for c in ws[1]]
+            if COL_DATA in cabecalho:
+                col = cabecalho.index(COL_DATA) + 1
+                for (cel,) in ws.iter_rows(min_row=2, min_col=col, max_col=col):
+                    if cel.value is not None:
+                        cel.number_format = "DD/MM/YYYY"
+                ws.column_dimensions[get_column_letter(col)].width = max(
+                    ws.column_dimensions[get_column_letter(col)].width or 0, 14)
     return buffer.getvalue()
+
+
+COL_DATA = "Data de Emissão da Nota"
+
+
+def _data_como_data(valor):
+    """'2026-10-01' -> date(2026, 10, 1); vazio -> None."""
+    from datetime import date
+
+    if isinstance(valor, str) and len(valor) == 10:
+        try:
+            return date.fromisoformat(valor)
+        except ValueError:
+            return None
+    return None
+
+
+def data_br(valor) -> str:
+    """'2026-10-01' -> '01/10/2026' (para tela e CSV)."""
+    d = _data_como_data(valor)
+    return d.strftime("%d/%m/%Y") if d else ""
 
 
 def _nf_como_numero(valor):
@@ -1036,11 +1148,13 @@ def _codigo_como_numero(valor):
 
 def preparar_exportacao(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    for col in ("Nota Fiscal de Referência", "Nota Fiscal de Emissão"):
+    if COL_DATA in out.columns:
+        out[COL_DATA] = pd.Series([_data_como_data(v) for v in out[COL_DATA]], index=out.index, dtype=object)
+    for col in ("Nota de Referência", "Nota Emitida"):
         if col in out.columns:
             out[col] = out[col].map(_nf_como_numero).astype(object)
-    if "Código do Material" in out.columns:
-        out["Código do Material"] = out["Código do Material"].map(_codigo_como_numero).astype(object)
+    if "Código do Produto" in out.columns:
+        out["Código do Produto"] = out["Código do Produto"].map(_codigo_como_numero).astype(object)
     if "Quantidade" in out.columns:
         # lista + dtype object: impede o pandas de converter tudo de volta para float
         out["Quantidade"] = pd.Series(
@@ -1054,6 +1168,8 @@ def preparar_exportacao(df: pd.DataFrame) -> pd.DataFrame:
 def para_csv(df: pd.DataFrame) -> bytes:
     """CSV no padrão do Excel em português: separador ';', decimal ',' e BOM UTF-8."""
     out = preparar_exportacao(df)
+    if COL_DATA in out.columns:
+        out[COL_DATA] = out[COL_DATA].map(lambda d: d.strftime("%d/%m/%Y") if d else "")
     if "Quantidade" in out.columns:
         out["Quantidade"] = out["Quantidade"].map(
             lambda q: "" if q is None or q != q else str(q).replace(".", ",")
@@ -1107,7 +1223,7 @@ def tabela_situacao(resultados: list[ResultadoArquivo]) -> pd.DataFrame:
 st.title("🧾 Consolidador de Notas Fiscais")
 st.caption(
     "Envie DANFEs (PDF) e/ou XMLs de NF-e. O resultado traz, item a item: "
-    "NF de Referência, NF de Emissão, Código do Material e Quantidade."
+    "Data de Emissão, Código do Produto, Quantidade, Nota Emitida e Nota de Referência."
 )
 
 arquivos = st.file_uploader(
@@ -1160,7 +1276,10 @@ def filtrar(tabela: pd.DataFrame, termo: str) -> pd.DataFrame:
     if not termo:
         return tabela
     termo = termo.strip().lower()
-    mascara = tabela.astype(str).apply(lambda col: col.str.lower().str.contains(termo, regex=False)).any(axis=1)
+    texto = tabela.astype(str)
+    if "Data de Emissão da Nota" in tabela.columns:  # permite buscar por "01/10/2026"
+        texto["Data de Emissão da Nota"] = tabela["Data de Emissão da Nota"].map(data_br)
+    mascara = texto.apply(lambda col: col.str.lower().str.contains(termo, regex=False)).any(axis=1)
     return tabela[mascara]
 
 
@@ -1171,7 +1290,12 @@ visao_itens = filtrar(itens, busca)
 
 def mostrar(tabela: pd.DataFrame) -> None:
     # exibe 2340 em vez de 2340.0 (fracionários como 2,5 continuam com casas decimais)
-    st.dataframe(preparar_exportacao(tabela).astype(str), hide_index=True, width="stretch")
+    exibir = preparar_exportacao(tabela)
+    if "Data de Emissão da Nota" in exibir.columns:
+        exibir["Data de Emissão da Nota"] = tabela["Data de Emissão da Nota"].map(data_br)
+    if "Quantidade" in exibir.columns:  # 2,5 com vírgula, como no Excel
+        exibir["Quantidade"] = exibir["Quantidade"].map(lambda q: "" if q is None or q != q else str(q).replace(".", ","))
+    st.dataframe(exibir.astype(str), hide_index=True, width="stretch")
 
 
 mostrar(visao)
