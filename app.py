@@ -457,7 +457,7 @@ def _sem_marca_dagua(page: pdfplumber.page.Page) -> pdfplumber.page.Page:
             return True
         a, b, c, d, *_ = obj.get("matrix") or (1, 0, 0, 1, 0, 0)
         horizontal = abs(b) < 1e-3 and abs(c) < 1e-3 and a > 0 and d > 0
-        return horizontal and obj["size"] <= mediana * 1.8
+        return horizontal and obj["size"] <= mediana * 2.5
 
     return page.filter(manter)
 
@@ -634,38 +634,44 @@ def _data_iso(dia: str, mes: str, ano: str) -> str:
 def _data_emissao_da_pagina(page: pdfplumber.page.Page, texto: str) -> str:
     """Data de emissão da NF no DANFE.
 
-    1) Pela posição: a data logo ABAIXO do rótulo "DATA DE EMISSÃO" (quadro do
-       destinatário), alinhada com ele — evita pegar a "DATA DE SAÍDA/ENTRADA".
+    1) Pela posição: a data logo ABAIXO do rótulo "DATA DE EMISSÃO", alinhada com ele
+       (evita pegar a "DATA DE SAÍDA/ENTRADA", que fica ao lado). A busca é feita
+       direto nos caracteres da página, então funciona mesmo quando o rótulo vem em
+       fonte pequena/itálica com as palavras "grudadas" (DATADEEMISSÃO).
     2) Na mesma linha, logo após o rótulo (ex.: canhoto "data de emissão: 01/10/2026").
     3) Pelo texto: primeira data nas 2 linhas seguintes ao rótulo.
     """
-    linhas = _linhas_de_palavras(page)
-    for i, l in enumerate(linhas):
-        t = normalizar(l["texto"])
-        m = _RE_ROTULO_EMISSAO.search(t)
-        if not m:
-            continue
-        # palavras que formam o rótulo (pelo deslocamento no texto)
-        rotulo = [w for w, off in zip(l["palavras"], l["offsets"]) if m.start() <= off < m.end()]
-        if not rotulo:
-            continue
-        x0, x1 = rotulo[0]["x0"], rotulo[-1]["x1"]
-        # 1) abaixo e alinhada
-        for abaixo in linhas[i + 1 : i + 4]:
-            if abaixo["top"] - l["bottom"] > 25:
-                break
-            for w in abaixo["palavras"]:
-                d = _RE_DATA.search(w["text"])
-                centro = (w["x0"] + w["x1"]) / 2
-                if d and x0 - 20 <= centro <= x1 + 20:
-                    iso = _data_iso(*d.groups())
-                    if iso:
-                        return iso
-        # 2) na mesma linha, logo depois do rótulo
-        depois = l["texto"][l["offsets"][l["palavras"].index(rotulo[-1])] :]
-        d = _RE_DATA.search(depois[:40])
-        if d and _data_iso(*d.groups()):
-            return _data_iso(*d.groups())
+    try:
+        rotulos = page.search(r"DATA\s*D[AEO]\s*EMISS(?:Ã|A)O|DT\.?\s*(?:DE\s*)?EMISS(?:Ã|A)O",
+                              regex=True, case=False)
+        datas = page.search(r"(?<!\d)\d{2}/\d{2}/\d{4}(?!\d)", regex=True)
+    except Exception:  # noqa: BLE001
+        rotulos, datas = [], []
+
+    def iso(d) -> str:
+        m = _RE_DATA.search(d["text"])
+        return _data_iso(*m.groups()) if m else ""
+
+    # rótulos em MAIÚSCULAS (quadro do destinatário) têm prioridade sobre o canhoto
+    rotulos.sort(key=lambda r: (r["text"] != r["text"].upper(), r["top"]))
+    for r in rotulos:
+        # 1) abaixo e alinhada (até ~25 pt abaixo, centro horizontal perto do rótulo)
+        candidatas = [
+            d for d in datas
+            if 0 <= d["top"] - r["bottom"] <= 25
+            and r["x0"] - 25 <= (d["x0"] + d["x1"]) / 2 <= r["x1"] + 25
+        ]
+        candidatas.sort(key=lambda d: (d["top"] - r["bottom"], abs((d["x0"] + d["x1"]) / 2 - (r["x0"] + r["x1"]) / 2)))
+        for d in candidatas:
+            if iso(d):
+                return iso(d)
+        # 2) na mesma linha, logo à direita do rótulo
+        mesma_linha = [d for d in datas if abs(d["top"] - r["top"]) <= 3 and 0 <= d["x0"] - r["x1"] <= 80]
+        mesma_linha.sort(key=lambda d: d["x0"])
+        for d in mesma_linha:
+            if iso(d):
+                return iso(d)
+
     # 3) fallback textual: rótulo "EMISSÃO" e a primeira data nas linhas seguintes
     linhas_txt = texto.splitlines()
     for i, linha in enumerate(linhas_txt):
@@ -1204,7 +1210,7 @@ st.set_page_config(page_title="Consolidador de NF-e", page_icon="🧾", layout="
 # --------------------------------------------------------------------------- #
 # Mude este valor a cada nova versão do leitor: força o reprocessamento dos arquivos
 # (sem isso, um arquivo já enviado antes poderia mostrar o resultado da versão antiga).
-VERSAO_LEITOR = "2026-10-11.4"
+VERSAO_LEITOR = "2026-10-11.5"
 
 
 @st.cache_data(show_spinner=False, max_entries=2000)
